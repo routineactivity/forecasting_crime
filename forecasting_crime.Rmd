@@ -1,0 +1,448 @@
+---
+title: "Forecasting crime"
+author: "Iain @routineactivity"
+date: "22/05/2021"
+output: 
+  html_document:
+    toc: TRUE
+    number_sections: yes
+    toc_depth: 2
+---
+
+# Overview
+
+Forecasting of public safety problems using time series analysis is an area that receives relatively limited attention. 
+
+In UK policing, longer term demand forecasts are found in a [Force Management Statement](https://www.justiceinspectorates.gov.uk/hmicfrs/police-forces/integrated-peel-assessments/force-management-statements/). Among it's aims, this document is expected to explain the demand a police force expects to face in the next four years. Forecasts of demand may be used to inform strategic decisions regarding organisational resources.
+
+Examples of linear regression used in the Metropolitan Police FMS can be seen [here](https://www.met.police.uk/SysSiteAssets/media/downloads/force-content/met/about-us/bg-to-business-plan-fms-may-2019.pdf).
+
+Quite often, forecasts are used to assist in decision making and then forgotten about. Until Covid-19. Now we are using forecasts to try and determine where levels of crime would usually have been and quantifying the extent of the impact lockdown has had on external demands for service. This may prompt a move towards more advanced forecasting techniques used in FMS but also in assessing crime prevention efforts in the future - moving away from the simplistic binary comparison and percentage change that are traditionally relied upon in public safety performance analysis.
+
+A couple of recent papers caught my interest prompting me to produce this short forecasting walk-through script.
+
+* [Initial evidence on the relationship between the coronavirus pandemic and crime in the United States](https://crimesciencejournal.biomedcentral.com/articles/10.1186/s40163-020-00117-6)
+* [Six months in: pandemic crime trends in England and Wales](https://crimesciencejournal.biomedcentral.com/articles/10.1186/s40163-021-00142-z)
+
+# Libraries and data
+
+Libraries used as below.
+
+```{r libraries, message=FALSE, warning=FALSE}
+
+library(tidyverse)
+library(janitor)
+library(tsibble)
+library(fable)
+library(forecast)
+library(astsa)
+
+```
+
+
+I've chosen to use the Metropolitan Police ward level data which covers the period 2010 to 2018. This is available at the [Greater London Authority](https://data.london.gov.uk/dataset/recorded_crime_summary) website.
+
+```{r data import, message=FALSE, warning=FALSE}
+# read in data
+gla_mps_ward <- read.csv("https://data.london.gov.uk/download/recorded_crime_summary/b03b8f4a-075f-4666-9c1d-8d9b0bfe3e63/MPS_Ward_Level_Crime_Historic_NewWard.csv") 
+
+# save data file
+save(gla_mps_ward, file = "data_gla_mps_ward.RData")
+
+# clean column headers
+gla_mps_ward <- clean_names(gla_mps_ward)
+
+# pivot data
+gla_mps_ward <- pivot_longer(gla_mps_ward, -c(ward_code , ward_name , borough , major_category, minor_category))
+
+# add date
+gla_mps_ward$day = 1
+gla_mps_ward$month <- substr(gla_mps_ward$name, 6,7)
+gla_mps_ward$year <- substr(gla_mps_ward$name, 2,5)
+gla_mps_ward$ym <- (paste(gla_mps_ward$year, gla_mps_ward$month, sep = "-"))
+gla_mps_ward <- gla_mps_ward %>% mutate(yrmn = yearmonth(ym))
+gla_mps_ward$date <- as.Date(paste(gla_mps_ward$year, gla_mps_ward$month, gla_mps_ward$day, sep = "-"))
+
+# data sets
+# aggregated borough crime data
+borough_crime <- gla_mps_ward %>%
+  group_by(borough, major_category, date, yrmn) %>%
+  filter(date <= "2018-12-01") %>%
+  summarise(total = sum(value))
+
+head(borough_crime)
+
+# aggregated met police wide crime data
+mps_wide_crime <- gla_mps_ward %>%
+  group_by(minor_category, date, yrmn) %>%
+  filter(date <= "2018-12-01") %>%
+  summarise(total = sum(value))
+
+head(mps_wide_crime)
+```
+
+# Basic trend plots
+
+Quite often we might just look at a line chart showing the data trend.
+
+The code below shows the trend in major categories of crime occurring in the London Borough of Enfield from 2010 to 2018. It's a bit messy presented in this way, we can only really see that most crime is Theft and Handling and that Violence Against The Person increased from January 2014 onward. 
+
+```{r line, message=FALSE, warning=FALSE}
+# Example, Enfield all major category
+borough_crime %>%
+  filter(borough=="Enfield") %>%
+  ggplot(aes(yrmn, total, colour = major_category)) +
+  geom_line()
+
+```
+
+
+Another way to look at this data is to use a facet wrap to view each major category individually. We are limited to describing what we see that has happened.
+
+```{r line2, message=FALSE, warning=FALSE}
+
+# Example, Enfield crime types on their own
+borough_crime %>%
+  filter(borough=="Enfield") %>%
+  ggplot(aes(yrmn, total)) +
+  geom_line() +
+  facet_wrap(~ major_category, scales = "free_y")
+```
+
+# Forecasting burglary in Enfield
+
+This next section looks at ways of deconstructing trends and applying forecasts using ETS (Error Trend and Seasonality, or exponential smoothing)
+
+## Decomposing a time series
+
+Time series can have a variety of patterns which can be observed when splitting them up into different parts. Time series decomposition is a way of doing this. Using London Borough of Enfield Burglary data we can see the trend (falling between 2012-2016, and rising thereafter) and seasonal component (peaks and troughs each year), and a random noise component (everything else in the time series).
+
+```{r decompose, message=FALSE, warning=FALSE}
+
+# prepare Enfield burglary data
+ye_burg_past <-
+  borough_crime %>%
+  filter(borough == "Enfield" & major_category == "Burglary") %>%
+  as_tsibble(index = yrmn)
+
+head(ye_burg_past)
+
+# create time series object of ye burglary
+ye_burg_ts <- ts(ye_burg_past$total, frequency = 12, start = c(2010, 4))
+
+# decompose time series
+ye_burg_dc <- decompose(ye_burg_ts)
+
+# plot decomposition
+plot(ye_burg_dc)
+
+```
+
+## ETS Forecast
+
+ETS are used for when there is a trend and/or seasonality in the data, which for Burglary in Enfield there is.
+
+We use the ETS model to forecast the next three years.
+
+```{r ye_burg, message=FALSE, warning=FALSE}
+
+# Forecast future Enfield burglary using the ye_burg_past object
+ye_burg_future <- ye_burg_past %>%
+  model(ETS(total)) %>%
+  forecast(h = "3 years")
+
+# view data
+head(ye_burg_future)
+
+# plot data
+autoplot(ye_burg_future, ye_burg_past) + 
+  ggtitle("Enfield Burglary Forecast")
+
+# export data, use code below if you want to view the forecast outside of R
+# write.csv(ye_burg_future, "ye_burg_future.csv")
+# MS Excel has its own [ETS.FORECAST function](https://exceljet.net/excel-functions/excel-forecast.ets-function) 
+
+```
+
+
+The underlying statistics can be used to determine how good the forecast is. 
+
+* ets(dataset) will find the best model for your data
+
+When this is assigned to an object, further statistics and diagnostics of the forecast can be viewed
+
+* checkresiduals(fitted model)
+
+This will provide details from the Ljung Box Test (which the burglary forecast fails - we are looking for a high Q statistic and a p value which is not significant) and charts. The residuals chart shouldn't show clusters of volatility, the ACF shouldn't show significant correlation between the residuals, and the count histogram ideally is symmetrical (a bell curve).
+
+To learn more about how to interpret, test and make conclusions about how sound the model is, there are references included at the end. Also see:
+
+* [Evaluating the regression model](https://otexts.com/fpp2/regression-evaluation.html)
+* [Estimatation and model selection](https://otexts.com/fpp2/estimation-and-model-selection.html)
+
+
+```{r etsresids, warning=FALSE, message=FALSE}
+# find the best model using ets
+ets(ye_burg_past$total)
+
+# fit ETS model to the enfield burglary past data
+fit.ets <- ets(ye_burg_past$total)
+
+# check the residuals
+checkresiduals(fit.ets)
+
+```
+
+## Creating multiple forecasts at once
+
+If we wanted to create forecasts for more than one problem simultaneously, we can do that by assigning a key when creating our tsibble object. When we display the forecasts we can facet by the key (category of crime in this instance). Note that most Fraud and Forgery offence recording moved away from police forces.
+
+```{r multiforecast, message=FALSE, warning=FALSE}
+
+# create tsibble object for all crime types
+ye_past <-
+  borough_crime %>%
+  filter(borough == "Enfield") %>%
+  as_tsibble(index = yrmn, key = major_category)
+
+# forecast future
+ye_future <-
+  ye_past %>%
+  model(ETS(total)) %>%
+  forecast(h = "3 years")
+
+# plot with facet wrap
+autoplot(ye_future, ye_past) + 
+  facet_wrap(~ major_category, scales = "free_y") +
+  ggtitle("Enfield Crime Forecasts")
+```
+
+
+# Forecasting burglary using ARIMA
+
+Keeping with Burglary, this time for the whole of the Metropolitan Police, we will look at another method called ARIMA (Autoregressive Integrated Moving Average). The code for the data set is shown below.
+
+```{r metburg, message=FALSE, warning=FALSE}
+
+# filter the mps_wide_crime to burglary in a dwelling
+mps_burg <- mps_wide_crime %>%
+  filter(minor_category == "Burglary In A Dwelling") %>%
+  group_by(date) %>%
+  summarize(value = as.numeric(sum(total))) %>%
+  as_tsibble()
+
+# create an extensible time series object
+mps_burgxts <- xts::xts(order.by = mps_burg$date, mps_burg$value)
+
+```
+
+
+## View the data
+
+If we plot the data we can see that there is a seasonal pattern in London burglary and both a downward and upward trend.
+
+```{r mpsburgplot, warning=FALSE, message=FALSE}
+
+plot(mps_burgxts)
+
+```
+
+Differencing is sometimes applied to make a time series stationary by removing trends and/or seasonality (detrending). 
+
+You can learn more about this and why you may need to do this in the link below,
+
+* [Stationarity and differencing](https://otexts.com/fpp2/stationarity.html)
+
+The code below as an example shows the Met Police burglary trend when the time series is differenced, and when the time series is differenced taking account of seasonal cycles (adding lag=12).
+
+```{r mpsburgdiff, warning=FALSE, message=FALSE}
+
+# difference time series
+diff1 <- diff(log(mps_burgxts))
+
+# seasonal time series differencing
+diff2 <- (diff(log(mps_burgxts), lag =12))
+
+
+#plot
+par(mfrow =c(1,2))
+autoplot(diff1)
+autoplot(diff2)
+
+```
+
+## Identifying model types
+
+The acf2 function is used to observe Autocorrelation and Partial Autocorrelation. These show whether the elements of a time series (or differenced time series) are correlated positively, negatively or independent of one another. The x-axis show lags between those elements.
+
+These can be used to decide on the type of model needed for an ARIMA forecast.
+
+* AR(p) model when the ACF tails off and the PACF cuts off abruptly at a lag
+* MA(q) model when the ACF cuts off abruptly at a lag and the PACF tails off
+* ARMA when both the ACF and PACF tails off
+
+To learn more about how to interpret acf plots and how they relate to ARIMA models see the link below:
+
+* [Non-Seasonal ARIMA: ACF and PACF Plots section](https://otexts.com/fpp2/non-seasonal-arima.html)
+
+```{r acf, warning=FALSE, message=FALSE}
+
+# acf and pacf plot of burglary data
+acf2(mps_burgxts)
+
+# acf and pacf plot of differenced burglary data
+acf2(diff(mps_burgxts))
+
+```
+
+## Experimenting with different model inputs
+
+ARIMA models are classified using the values of p,d,q - p is the number of autoregressive terms, d is the number of non-seasonal differences and q is the number of lagged forecast errors. SARIMA (seasonal models) are classified using p,d,q,P,D,Q and the number of seasonal periods.
+
+The code below shows examples of how we would create an AR, MA, ARIMA and SARIMA model using the burglary data.
+
+Each model outputs residuals with four charts. What we are looking to see in these plots to determine if our forecast model is sound are:
+
+* We don't want to see patterns in the residuals
+* We don't want to see ACF that has large values
+* Q-Q plot suggests normality, no/few outliers
+* We don't want to see all points below the line on the Q-Statistic
+
+We can see these are problems in the AR1, AR2, MA1 and ARIMA models using the Met Police burglary data. The SARIMA model looks to be the best. 
+
+```{r models, warning=FALSE, message=FALSE}
+
+# AR1, this would be used if the ACF tails off and PACF cuts off at lag 1
+m1 <- sarima(mps_burgxts, p = 1, d = 0, q = 0)
+# AR2, similar to above but if the PACF cuts off at lag 2, and we can just use the numbers to shorten our code
+m2 <- sarima(mps_burgxts, 2,0,0)
+# MA1, this would be used if the ACF cuts off at lag 1 and the PACF tails off
+m3 <- sarima(mps_burgxts, 0,0,1)
+# ARIMA, this would be used if both the ACF/PACF tails off
+m4 <- sarima(mps_burgxts, 1,0,1)
+# SARIMA, seasonal model with 12 seasons (monthly data)
+m5 <- sarima(mps_burgxts, 1,0,1,1,0,1,12)
+
+```
+
+
+We can look at the AIC values to see which of these models is best. We are looking for the one with the lowest AIC. We can see that m5 (SARIMA) had the lowest AIC value. Other values can be called for the model fit, AICc, BIC and ttable.
+
+```{r AIC, warning=FALSE, message=FALSE}
+
+# compare AIC values for each model
+m1$AIC
+m2$AIC
+m3$AIC
+m4$AIC
+m5$AIC
+
+```
+
+## Automatically choosing forecast model
+
+We can use different methods to identify the best p,d,q,P,D,Q inputs for our data automatically. The auto.arima() can be used for non-seasonal models.
+
+```{r autorima, message=FALSE, warning=FALSE}
+
+# auto arima burg data
+auto.arima(mps_burgxts)
+
+# auto arima differenced data
+auto.arima(diff(mps_burgxts))
+
+```
+
+
+We could also use a function to identify the best model inputs. The function below is taken from the book Introductory Time Series with R by Andrew V. Metcalfe and Paul S.P. Cowpertwait.
+
+This function checks a range of models using trial-and-error and then selects the one with the best AIC.
+
+```{r bestarima, message=FALSE, warning=FALSE}
+
+# get best arima function
+get.best.arima <- function(x.ts, maxord = c(1,1,1,1,1,1)) 
+  {
+  best.aic <- 1e8
+  n <- length(x.ts)
+  for (p in 0:maxord[1]) for(d in 0:maxord[2]) for(q in 0:maxord[3])
+    for (P in 0:maxord[4]) for(D in 0:maxord[5]) for(Q in 0:maxord[6])
+    {
+      fit <- arima(x.ts, order = c(p,d,q),
+                   seas = list(order = c(P,D,Q),
+                               frequency(x.ts)), method = "CSS")
+      fit.aic <- -2 * fit$loglik + (log(n) + 1) * length(fit$coef)
+      if (fit.aic < best.aic)
+      {
+        best.aic <- fit.aic
+        best.fit <- fit
+        best.model <- c(p,d,q,P,D,Q)
+      }
+    } 
+  list(best.aic, best.fit, best.model)
+}
+
+```
+
+
+We can use this function on the Met Police burglary data using the code below. This identifies the best pdqPDQ for our data as 1,1,2,0,2,1.
+
+```{r bestburg, message=FALSE, warning=FALSE}
+
+# best burglary arima
+best_burg <- get.best.arima(mps_burgxts, maxord = c(2,2,2,2,2,2))
+
+# inputs
+best_burg
+
+```
+
+## Fitting the SARIMA model
+
+We can fit the model to our burglary data. We are going to forecast 3 years ahead, or 36 months. As the data ends in December 2018, the forecast will be for 2019-2021.
+
+```{r fit, message=FALSE, warning=FALSE}
+
+# forecast burglary
+m6 <- sarima.for(mps_burgxts, n.ahead = 36, 1,1,2,0,2,1,12)
+
+# view the predicted values
+m6$pred
+
+# view the se
+m6$se
+
+```
+
+# See how the forecast looks against the actual values
+
+Here we are just taking a straightforward look at what actually happened in terms of the burglary offences in London during 2019 and onwards in relation to the forecast.
+
+We can see from the blue dotted line that the forecast performed very well right up until March 2020, but since Covid-19 has become much less accurate. This is of course no surprise, with many households being regularly occupied with instructions to stay indoors or work from home, the opportunities for burglary have been reduced. 
+
+```{r fc, warning=FALSE, message=FALSE}
+
+# create a vector of actual data to date
+# these values were taken from looking at the Met Police stats and data tableau dashboard
+# Actual data
+actual <- c(5617,4890,5399,4582,4596,4494,4510,4417,4859,5468,5431,5286,5242,4706,3821,2521,2945,3318,3807,3953,4013,4385,4179,3774,3230)
+x <- mps_burg$value
+x <- as.numeric(x)
+new <- append(x, actual)
+
+# forecast with actual
+par(mfrow =c(1,1))
+m6 <- sarima.for(mps_burgxts, n.ahead = 36, 1,1,2,0,2,1,12)
+lines(new, lwd = 1, lty = 2, col = "blue")
+title("SARIMA Forecast: Met Police Residential Burglary")
+
+```
+
+
+
+# Learn more
+
+* [Forecasting: Principles and Practice](https://otexts.com/fpp2/), Rob J Hyndman and George Athanasopolous
+* [Time Series Analysis and Its Applications](https://www.stat.pitt.edu/stoffer/tsa4/tsa4.pdf), Robert H. Shumway and David S.Stoffer
+* [R Code for TSA and Its Applications](https://github.com/nickpoison/tsa4/blob/master/textRcode.md)
+* [Introductory Time Series with R](https://link.springer.com/book/10.1007/978-0-387-88698-5), Andrew V. Metcalfe, Paul S.P. Cowpertwait
